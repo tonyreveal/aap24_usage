@@ -1,0 +1,141 @@
+---
+- name: Collect AAP 2.5+ platform workload baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    lookback_days: 90
+    growth_percent: 30
+    target_utilization: 0.70
+    output_dir: "{{ playbook_dir }}/reports"
+    collect_metrics: true
+    validate_certs: true
+    ca_file: ""
+    collect_eda: true
+    collect_hub: true
+    collect_hub_artifact_sizes: false
+    eda_api_path: /api/eda/v1/
+    hub_api_path: /api/galaxy/pulp/api/v3/
+    max_pages: 10000
+  tasks:
+    - name: Include platform gateway credentials from vault
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/secrets.yml"
+      no_log: true
+
+    - name: Check connection parameters
+      ansible.builtin.assert:
+        that:
+          - controller_url is match('^https://[^/?#@]+/?$')
+          - controller_username | length > 0
+          - controller_password | length > 0
+        fail_msg: Set controller_url (gateway HTTPS origin), controller_username and controller_password in secrets.yml
+      no_log: true
+
+    - name: Create private report directory
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Collect using a temporary read-scoped personal access token
+      when: not ansible_check_mode
+      module_defaults:
+        ansible.builtin.uri:
+          url_username: "{{ controller_username }}"
+          url_password: "{{ controller_password }}"
+          force_basic_auth: true
+          use_netrc: false
+          follow_redirects: none
+          validate_certs: "{{ validate_certs | bool }}"
+          ca_path: "{{ ca_file if (validate_certs | bool and ca_file | length > 0) else omit }}"
+          timeout: 60
+      block:
+        - name: Create temporary personal token with username and password
+          ansible.builtin.uri:
+            url: "{{ controller_url | regex_replace('/$', '') }}/api/gateway/v1/tokens/"
+            method: POST
+            body_format: json
+            body:
+              description: Temporary AAP 2.5+ platform sizing collector
+              application: null
+              scope: read
+            status_code: 201
+          register: temporary_token
+          changed_when: true
+          no_log: true
+          # Do not retry POST: a lost response could otherwise create extra tokens.
+
+        - name: Collect Controller and optional EDA and Hub API data
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/collect_usage.py"
+              - "{{ '--validate-certs' if validate_certs | bool else '--no-validate-certs' }}"
+              - "{{ '--eda' if collect_eda | bool else '--no-eda' }}"
+              - "{{ '--hub' if collect_hub | bool else '--no-hub' }}"
+              - "{{ '--hub-artifact-sizes' if collect_hub_artifact_sizes | bool else '--no-hub-artifact-sizes' }}"
+              - --eda-api-path
+              - "{{ eda_api_path }}"
+              - --hub-api-path
+              - "{{ hub_api_path }}"
+              - --max-pages
+              - "{{ max_pages | string }}"
+              - --output
+              - "{{ output_dir }}"
+              - --days
+              - "{{ lookback_days | string }}"
+              - --growth
+              - "{{ growth_percent | string }}"
+              - --utilization
+              - "{{ target_utilization | string }}"
+              - "{{ '--metrics' if collect_metrics | bool else '--no-metrics' }}"
+          environment:
+            CONTROLLER_HOST: "{{ controller_url }}"
+            CONTROLLER_OAUTH_TOKEN: "{{ temporary_token.json.token }}"
+            CONTROLLER_CA_FILE: "{{ ca_file }}"
+            # Avoid inheriting the user's password in the collector process.
+            CONTROLLER_PASSWORD: ""
+          register: collection
+          changed_when: collection.rc == 0
+          no_log: true
+
+        - name: Report location
+          ansible.builtin.debug:
+            msg: "{{ collection.stdout }}"
+
+      rescue:
+        - name: Explain authentication or collection failure without printing credentials
+          ansible.builtin.fail:
+            msg: >-
+              Token creation or collection failed. Check the platform gateway URL, TLS settings,
+              username/password, API Basic authentication and token-creation permissions.
+              If collection started, also check API access, output permissions and retention.
+              Sensitive task output is suppressed. Token cleanup is attempted below.
+
+      always:
+        - name: Revoke the token created by this run
+          when:
+            - temporary_token is defined
+            - temporary_token.json is defined
+            - temporary_token.json.id is defined
+          block:
+            - name: Delete temporary token using username and password
+              ansible.builtin.uri:
+                url: "{{ controller_url | regex_replace('/$', '') }}/api/gateway/v1/tokens/{{ temporary_token.json.id | int }}/"
+                method: DELETE
+                status_code: [204, 404]
+              register: token_cleanup
+              until: token_cleanup.status | default(0) in [204, 404]
+              retries: 3
+              delay: 2
+              changed_when: token_cleanup.status == 204
+              no_log: true
+              # Use Basic auth: the read-scoped token cannot authorize its own DELETE.
+          rescue:
+            - name: Report incomplete token cleanup
+              ansible.builtin.fail:
+                msg: >-
+                  Could not revoke temporary token ID {{ temporary_token.json.id | int }}.
+                  Remove that token in AAP. Any generated reports remain in {{ output_dir }}.
+...
